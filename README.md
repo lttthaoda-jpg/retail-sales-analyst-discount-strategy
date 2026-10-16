@@ -5,10 +5,6 @@ Loss-making orders wipe out the equivalent of **34.95%** of the profit earned on
 - **Dataset:** Sample Superstore (simulated), 10,194 transactions (2023–2026)
 - **Tools:** R (probit models, average marginal effects), Excel, AI tools (Claude AI)
 - **Method:** probit regression (3 models), model validation, observed loss rate by exact discount level, break-even discount
-## Results
-- 📄 [Full results on GitHub](Retail_Sales_Analysis_Central_Discount.md) (tables render directly)
-- 🌐 Interactive HTML version: `Retail_Sales_Analysis_Central_Discount.html` (download and open in a browser)
-- 🧾 Source code: [`Retail_Sales_Analysis_Central_Discount.qmd`](Retail_Sales_Analysis_Central_Discount.qmd)
 ## Repository structure
 ```
 ├── Retail_Sales_Analysis_Central_Discount.qmd   # all R code (Quarto)
