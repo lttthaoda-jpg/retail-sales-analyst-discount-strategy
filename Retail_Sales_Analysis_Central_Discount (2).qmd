@@ -1,0 +1,721 @@
+---
+title: "Retail Sales Analysis: Discount Strategy & Loss Risk in the Central Region"
+subtitle: "Do discounts drive loss-making orders, and which discount levels are relatively safe?"
+format:
+  gfm:
+    toc: true
+    echo: false          # GitHub page shows results only; the code stays in this .qmd
+  html:
+    toc: true
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## About this project
+
+Reproducible analysis behind the slide deck **Retail Sales Analysis: Discount Strategy & Loss Risk in the Central Region**. Every table in this document matches a table on the slides, in the same order.
+
+- **Dataset:** Sample Superstore (simulated), 10,194 transactions (2023–2026)
+- **Tools:** R (primary tool), Excel, AI tools (ChatGPT, Gemini)
+
+**Business questions (Central region)**
+
+1. Does a higher discount go with a higher probability of a loss?
+2. Does the effect differ across categories and order sizes?
+3. Which discount levels are relatively safe, by category and sub-category?
+
+The dataset is simulated, so the results describe associations in this data and do not prove cause and effect.
+
+**How to run**
+
+1. Put the Sample Superstore Excel file in a `data/` folder next to this file and set `data_path` in the setup chunk if the file name differs. The sheet must be called `Orders`.
+2. Install the packages once (the chunk below is not evaluated automatically).
+3. Run `quarto render Retail_Sales_Analysis_Central_Discount.qmd` (or click **Render** in RStudio). This creates both a GitHub-friendly `.md` file and a self-contained `.html` file.
+
+```{r}
+#| label: install-packages
+#| eval: false
+install.packages(c(
+  "readxl", "dplyr", "tidyr", "janitor", "scales", "knitr",
+  "mfx", "pscl", "lmtest", "car", "pROC", "ResourceSelection"
+))
+```
+
+```{r}
+#| label: setup
+# Statistical packages first, tidyverse last, so dplyr verbs are not masked by MASS (loaded by mfx)
+library(mfx)                # probitmfx(): average marginal effects
+library(pscl)               # pR2(): McFadden pseudo R-squared
+library(lmtest)             # lrtest(): likelihood ratio test
+library(car)                # vif(): multicollinearity
+library(pROC)               # roc(), auc()
+library(ResourceSelection)  # hoslem.test(): Hosmer-Lemeshow test
+library(readxl)
+library(janitor)
+library(scales)
+library(knitr)
+library(dplyr)
+library(tidyr)
+
+options(scipen = 999)
+
+# ---- Data location ---------------------------------------------------------
+data_path <- "data/Du_lieu.xls"
+stopifnot("Data file not found: edit `data_path` in this chunk" = file.exists(data_path))
+
+# ---- Helpers ---------------------------------------------------------------
+# Tables: first column left-aligned, all other columns right-aligned
+show_table <- function(df, caption = NULL) {
+  knitr::kable(df, caption = caption, align = c("l", rep("r", ncol(df) - 1)))
+}
+
+# Significance marks as on the slides: *** 1%, ** 5%, * 10%, . 15%, NS = not significant
+# (asterisks are escaped so Markdown does not read them as bold/italic)
+sig_mark <- function(p) {
+  ifelse(p < 0.01, "\\*\\*\\*",
+  ifelse(p < 0.05, "\\*\\*",
+  ifelse(p < 0.10, "\\*",
+  ifelse(p < 0.15, ".", "NS"))))
+}
+
+# "loss / n (rate%)" cell used in the threshold table:
+# whole percent when n < 10, otherwise one decimal; a trailing ".0" is dropped (0%, 100%)
+fmt_rate <- function(loss, n) {
+  pct <- ifelse(n < 10,
+                sprintf("%.0f", 100 * loss / n),
+                sub("\\.0$", "", sprintf("%.1f", 100 * loss / n)))
+  sprintf("%d/%d (%s%%)", loss, n, pct)
+}
+
+region_levels <- c("Central", "East", "South", "West")
+```
+
+```{r}
+#| label: load-data
+data <- read_excel(data_path, sheet = "Orders") %>%
+  clean_names()   # e.g. "Sub-Category" -> sub_category, "State/Province" -> state_province
+
+data <- data %>%
+  mutate(
+    is_loss      = as.integer(profit < 0),   # 1 = loss-making order
+    discount_pct = discount * 100,           # discount in percentage points (used in the models)
+    discount_lvl = round(discount * 100),    # exact discount level (used in the tables)
+    log_sales    = log(sales)                # proxy for order size
+  )
+
+central <- data %>%
+  filter(region == "Central") %>%
+  mutate(category_factor = droplevels(factor(category)))   # Furniture = reference group
+
+central_df <- as.data.frame(central)   # plain data.frame for glm() / probitmfx()
+
+stopifnot(
+  "Expected 10,194 transactions" = nrow(data) == 10194,
+  "Furniture must be the reference category" = levels(central$category_factor)[1] == "Furniture"
+)
+```
+
+## Executive summary
+
+**Key findings**
+
+- Losses equal 34.95% of the profit earned on profitable orders. Central is hit hardest (58.6%).
+- In Central, orders discounted 30%+ are 28% of orders but cause 94% of losses. 80% discounts alone cause 54%.
+- A 1-point higher discount goes with a 1.1–1.8 point higher probability of a loss.
+- Furniture has the highest loss exposure (66% of orders), but the data does not show it is more sensitive to discounts. It is discounted deeper and more often.
+
+**Top recommendations**
+
+- Review 80% discounts on Binders and Appliances first.
+- No Furniture discounts of 30%+ without a margin check.
+- Set discounts by sub-category against its break-even margin.
+- Pilot discount levels between 5% and 25%, where the data has almost no orders.
+
+## 1. Identifying the problem
+
+```{r}
+#| label: key-figures
+profit_pos <- sum(data$profit[data$profit > 0])     # profit earned on profitable orders
+loss_total <- -sum(data$profit[data$profit < 0])    # total losses
+net_profit <- sum(data$profit)
+loss_share <- loss_total / profit_pos               # losses as a share of profit on profitable orders
+
+tibble(
+  Metric = c("Profit on profitable orders", "Total losses", "Net profit",
+             "Losses as % of profit on profitable orders"),
+  Value  = c(dollar(profit_pos, accuracy = 1), dollar(-loss_total, accuracy = 1),
+             dollar(net_profit, accuracy = 1), percent(loss_share, accuracy = 0.01))
+) %>% show_table()
+```
+
+Loss-making orders wipe out the equivalent of 34.95% of the profit earned on profitable orders.
+
+**Table 1: Total loss by region and category, 2023–2026**
+
+```{r}
+#| label: table1
+table1_num <- data %>%
+  filter(profit < 0) %>%
+  group_by(region, category) %>%
+  summarise(loss = -sum(profit), .groups = "drop") %>%
+  pivot_wider(names_from = category, values_from = loss, values_fill = 0) %>%
+  mutate(Total = Furniture + `Office Supplies` + Technology,
+         region = factor(region, levels = region_levels)) %>%
+  arrange(region)
+
+table1_num %>%
+  mutate(across(-region, ~ dollar(.x, accuracy = 1))) %>%
+  rename(Region = region) %>%
+  show_table()
+```
+
+Loss-making orders erode a large share of profit, and Central records the largest total loss. It is analysed first.
+
+**Table 2: Loss severity by region (why Central?)**
+
+```{r}
+#| label: table1b
+table1b_num <- data %>%
+  group_by(region) %>%
+  summarise(
+    share_orders_lose  = mean(is_loss),
+    loss_pct_of_profit = -sum(profit[profit < 0]) / sum(profit[profit > 0]),
+    .groups = "drop"
+  ) %>%
+  mutate(region = factor(region, levels = region_levels)) %>%
+  arrange(region)
+
+table1b_num %>%
+  transmute(
+    Region = region,
+    `Orders that lose money`                     = percent(share_orders_lose, accuracy = 0.1),
+    `Loss as % of profit from profitable orders` = percent(loss_pct_of_profit, accuracy = 0.1)
+  ) %>%
+  show_table()
+```
+
+East's total loss is only about $6k lower than Central's, but Central loses money on far more of its orders, and its losses are much larger relative to its profit. Central is the stronger case to analyse first.
+
+**Table 3: Revenue, discount and loss indicators in Central, by category**
+
+```{r}
+#| label: table2
+table2_num <- central %>%
+  group_by(category) %>%
+  summarise(
+    revenue        = sum(sales),
+    avg_discount   = mean(discount),
+    margin         = sum(profit) / sum(sales),
+    share_loss     = mean(is_loss),
+    share_30plus   = mean(discount_lvl >= 30),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(margin))
+
+table2_num %>%
+  transmute(
+    Category                 = category,
+    `Revenue ($)`            = comma(revenue, accuracy = 1),
+    `Avg. discount`          = percent(avg_discount, accuracy = 0.1),
+    `Profit margin`          = percent(margin, accuracy = 0.1),
+    `Orders that lose money` = percent(share_loss, accuracy = 0.1),
+    `Orders discounted 30%+` = percent(share_30plus, accuracy = 0.1)
+  ) %>%
+  show_table()
+```
+
+- Furniture has the highest share of loss-making orders and the only negative margin.
+- Office Supplies loses the most dollars ($33,531).
+- In both cases, heavy discounting goes together with low or negative margins. This motivates a closer look at how discounts are used.
+
+## 2. Questions, methods and how discounts are used
+
+| Question | Method |
+|---|---|
+| 1. Does a higher discount go with a higher probability of a loss? | Model 1: Discount + Log Sales + Category |
+| 2. Does the effect differ across categories (higher sensitivity, or simply heavier discounting?) and order sizes? | Model 2: Discount × Log Sales; Model 3: Discount × Category; Average Marginal Effects |
+| 3. Which discount levels are relatively safe? | Observed loss rate by exact discount level; implied break-even discount |
+
+Discounts are not continuous. They take only a few values:
+
+```{r}
+#| label: discount-levels
+#| results: asis
+cat("**", paste(sort(unique(central$discount_lvl)), collapse = ", "), "%**\n", sep = "")
+```
+
+Each category uses only some of them:
+
+```{r}
+#| label: discount-levels-by-category
+central %>%
+  group_by(category) %>%
+  summarise(`Discount levels used` = paste0(paste(sort(unique(discount_lvl)), collapse = ", "), "%"),
+            .groups = "drop") %>%
+  rename(`Category (Central)` = category) %>%
+  show_table()
+```
+
+**Takeaway:** discount level and sub-category are tightly linked, so it is hard to separate "the effect of the discount" from "the effect of the product". This shapes how the results should be read.
+
+## 3. Building the models
+
+The outcome is binary, so **probit regression** is used to model the probability that an order is loss-making in Central.
+
+| Model | Specification | Answers |
+|---|---|---|
+| Model 1 | P(Loss=1) = f(Discount, Log Sales, Category) | Question 1 |
+| Model 2 | P(Loss=1) = f(Discount, Log Sales, Discount × Log Sales, Category) | Question 2 (order size) |
+| Model 3 | P(Loss=1) = f(Discount, Category, Discount × Category, Log Sales) | Question 2 (category) |
+
+- **Loss:** 1 if the order lost money, 0 if profitable
+- **Discount:** discount applied to the transaction (%)
+- **Log Sales:** natural log of order revenue (proxy for order size)
+- **Category:** Furniture (reference), Office Supplies, Technology
+- **Discount × Log Sales / Category:** test whether the discount effect changes with order size or category
+
+```{r}
+#| label: models
+m1 <- glm(is_loss ~ discount_pct + log_sales + category_factor,
+          data = central_df, family = binomial(link = "probit"))
+
+m2 <- glm(is_loss ~ discount_pct * log_sales + category_factor,
+          data = central_df, family = binomial(link = "probit"))
+
+m3 <- glm(is_loss ~ discount_pct * category_factor + log_sales,
+          data = central_df, family = binomial(link = "probit"))
+```
+
+```{r}
+#| label: model-summaries
+#| eval: false
+# Full coefficient tables (not shown on the slides). Set `eval: true` to run.
+summary(m1)
+summary(m2)
+summary(m3)
+```
+
+**Table 4: Average Marginal Effects (probit)**
+
+```{r}
+#| label: table3-ame
+ame1 <- probitmfx(is_loss ~ discount_pct + log_sales + category_factor,
+                  data = central_df, atmean = FALSE)
+ame2 <- probitmfx(is_loss ~ discount_pct * log_sales + category_factor,
+                  data = central_df, atmean = FALSE)
+ame3 <- probitmfx(is_loss ~ discount_pct * category_factor + log_sales,
+                  data = central_df, atmean = FALSE)
+
+term_labels <- c(
+  "discount_pct"                                = "Discount",
+  "log_sales"                                   = "Log Sales",
+  "category_factorOffice Supplies"              = "Office Supplies (vs Furniture)",
+  "category_factorTechnology"                   = "Technology (vs Furniture)",
+  "discount_pct:log_sales"                      = "Discount × Log Sales",
+  "discount_pct:category_factorOffice Supplies" = "Discount × Office Supplies",
+  "discount_pct:category_factorTechnology"      = "Discount × Technology"
+)
+
+# One formatted cell per term: effect in percentage points + significance mark.
+# As on the slide, the two category rows of Model 3 show only "NS" when not significant.
+tidy_ame <- function(obj, model_name) {
+  est <- obj$mfxest      # columns: dF/dx, Std. Err., z, P>|z|
+  tibble(
+    term  = rownames(est),
+    model = model_name,
+    effect = est[, 1] * 100,
+    p      = est[, 4]
+  ) %>%
+    mutate(
+      cell = sprintf("%+.2f%% (%s)", effect, sig_mark(p)),
+      cell = if_else(model == "Model 3" &
+                       term %in% c("category_factorOffice Supplies", "category_factorTechnology") &
+                       p >= 0.15,
+                     "NS", cell)
+    ) %>%
+    dplyr::select(term, model, cell)
+}
+
+table3 <- bind_rows(
+  tidy_ame(ame1, "Model 1"),
+  tidy_ame(ame2, "Model 2"),
+  tidy_ame(ame3, "Model 3")
+) %>%
+  pivot_wider(names_from = model, values_from = cell, values_fill = "–") %>%
+  arrange(match(term, names(term_labels))) %>%
+  mutate(Variable = unname(ifelse(is.na(term_labels[term]), term, term_labels[term]))) %>%
+  dplyr::select(Variable, `Model 1`, `Model 2`, `Model 3`)
+
+show_table(table3)
+```
+
+*\*\*\* 1%, \*\* 5%, \* 10%, . 15%; NS = not significant*
+
+- One more point of discount goes with 1.1–1.8 points higher probability of a loss.
+- The effect is fairly consistent across order sizes (Discount × Log Sales is not significant).
+- Compared with Furniture, Office Supplies and Technology have lower loss probability in Models 1–2, but this is not robust in Model 3.
+
+**Exposure vs. sensitivity**
+
+- *Risk exposure* is how much loss a category actually has (an observed result). *Sensitivity* is how much the probability of a loss rises per 1 point of discount (a slope).
+- Furniture has the highest loss exposure: 66% of its orders lose money.
+- But there is no evidence that Furniture is more sensitive to discounts: the interaction terms are mostly not significant.
+- Its exposure most likely comes from how it is discounted: deeper and more often (67% of orders at 30%+, vs 21% for Office Supplies and 4% for Technology).
+- Caution: "not significant" does not prove equal sensitivity. The categories barely overlap in discount levels, so the test has little power.
+
+## 4. Model validation
+
+```{r}
+#| label: table4-validation
+validate_model <- function(model, d) {
+  v <- suppressWarnings(car::vif(lm(formula(model), data = d)))
+  # With a factor in the model, vif() returns a matrix: GVIF, Df, GVIF^(1/(2*Df)).
+  # "Max VIF" on the slide is the largest GVIF^(1/(2*Df)) (last column).
+  max_vif <- if (is.matrix(v)) max(v[, ncol(v)]) else max(v)
+  c(
+    pseudo_r2 = unname(pscl::pR2(model)["McFadden"]),
+    lr_p      = lmtest::lrtest(model)$`Pr(>Chisq)`[2],
+    max_vif   = max_vif,
+    auc       = as.numeric(pROC::auc(pROC::roc(model$y, fitted(model), quiet = TRUE))),
+    hl_p      = ResourceSelection::hoslem.test(model$y, fitted(model))$p.value
+  )
+}
+
+fmt_validation <- function(v) {
+  unname(c(
+    sprintf("%.4f", v["pseudo_r2"]),
+    ifelse(v["lr_p"] < 0.001, "p < 0.001", sprintf("p = %.4f", v["lr_p"])),
+    sprintf("%.2f", v["max_vif"]),
+    sprintf("%.4f", v["auc"]),
+    sprintf("p = %.4f", v["hl_p"])
+  ))
+}
+
+vals <- lapply(list(m1, m2, m3), validate_model, d = central_df)
+
+tibble(
+  Criterion = c("McFadden Pseudo R²", "Likelihood Ratio Test", "Max VIF", "AUC",
+                "Hosmer-Lemeshow Test"),
+  `Model 1` = fmt_validation(vals[[1]]),
+  `Model 2` = fmt_validation(vals[[2]]),
+  `Model 3` = fmt_validation(vals[[3]])
+) %>% show_table()
+```
+
+*Note: "Max VIF" is the adjusted GVIF, GVIF^(1/(2·Df)), which is on a square-root scale. The usual cut-offs of 5 or 10 for VIF correspond to about 2.24 or 3.16 on this scale.*
+
+- All three models pass the tests for overall fit, goodness of fit, classification and multicollinearity.
+- Main conclusions are consistent across the three models.
+- **Why are Pseudo R² and AUC so high?** In this data, whether an order loses money is almost mechanically determined by the discount compared with the product's margin. It is not a sign of a "perfect" model.
+
+## 5. Discount threshold analysis
+
+**Table 5: Loss-making orders / total orders, by exact discount, Central**
+
+```{r}
+#| label: table-threshold
+tab_threshold_num <- central %>%
+  group_by(discount_lvl, category) %>%
+  summarise(n = n(), loss = sum(is_loss), .groups = "drop")
+
+tab_threshold_num %>%
+  mutate(cell = fmt_rate(loss, n)) %>%
+  dplyr::select(discount_lvl, category, cell) %>%
+  pivot_wider(names_from = category, values_from = cell, values_fill = "–") %>%
+  arrange(discount_lvl) %>%
+  mutate(Discount = paste0(discount_lvl, "%")) %>%
+  dplyr::select(Discount, Furniture, `Office Supplies`, Technology) %>%
+  show_table()
+```
+
+*"–" = no orders at that discount level*
+
+- Up to 10% is safe: none of the 846 orders lost money.
+- Furniture: no losses at 0%, almost all lose from 30%. Only 3 orders sit in between, so the data cannot show the turning point.
+- At 20%, safety depends on the sub-category (Art, Paper, Labels, Envelopes: no losses; Storage, Supplies, Accessories: 30–47%). See the supporting table B below.
+- We cannot say which category absorbs discounts better: categories overlap only at 20% and 30%, with very few orders.
+
+**Where Central's losses come from**
+
+```{r}
+#| label: table6-loss-share
+table6_num <- central %>%
+  filter(is_loss == 1) %>%
+  group_by(discount_lvl) %>%
+  summarise(loss_orders = n(), loss_usd = -sum(profit), .groups = "drop") %>%
+  mutate(share = loss_usd / sum(loss_usd)) %>%
+  arrange(discount_lvl)
+
+table6_num %>%
+  transmute(
+    Discount               = paste0(discount_lvl, "%"),
+    `Loss-making orders`   = loss_orders,
+    `Loss ($)`             = comma(loss_usd, accuracy = 1),
+    `Share of Central's loss` = percent(share, accuracy = 0.1)
+  ) %>%
+  show_table()
+```
+
+```{r}
+#| label: findings-numbers
+n_central        <- nrow(central)
+loss_central     <- -sum(central$profit[central$profit < 0])
+share_orders_30  <- mean(central$discount_lvl >= 30)
+share_loss_30    <- -sum(central$profit[central$profit < 0 & central$discount_lvl >= 30]) / loss_central
+share_loss_80    <- -sum(central$profit[central$profit < 0 & central$discount_lvl == 80]) / loss_central
+
+n_0pct    <- sum(central$discount_lvl == 0)
+n_10pct   <- sum(central$discount_lvl == 10)
+n_0_10    <- sum(central$discount_lvl <= 10)
+loss_0_10 <- sum(central$is_loss[central$discount_lvl <= 10])
+
+tibble(
+  Finding = c(
+    "Orders discounted 30% or more, as % of Central's orders",
+    "Share of Central's total loss caused by orders discounted 30% or more",
+    "Share of Central's total loss caused by 80% discounts",
+    "Orders at 0% discount",
+    "Orders at 10% discount (too few to judge)",
+    "Loss-making orders among all orders at 0–10% discount"
+  ),
+  Value = c(
+    percent(share_orders_30, accuracy = 0.1),
+    percent(share_loss_30,   accuracy = 0.1),
+    percent(share_loss_80,   accuracy = 0.1),
+    comma(n_0pct),
+    comma(n_10pct),
+    paste0(loss_0_10, " of ", comma(n_0_10))
+  )
+) %>% show_table()
+```
+
+Orders discounted 30% or more are 28% of Central's orders but cause 94% of its losses. 80% discounts (Binders and Appliances) alone cause 54%, and every one of these orders lost money.
+
+## 6. Recommendations
+
+1. Review 80% discounts on Binders and Appliances first: 54% of Central's total loss, every order lost money.
+2. No Furniture discounts of 30%+ without a margin check: Bookcases, Tables and Chairs break even around 19–25%; 94–100% of orders above that lose money (supporting table C).
+3. Review 20% discounts on Storage, Supplies and Accessories (loss rates 30–47%). 20% looks acceptable for Art, Paper, Labels and Envelopes.
+4. Set discounts by sub-category against its break-even margin, instead of one threshold per category.
+5. Pilot discount levels between 5% and 25%: the data has almost no orders there.
+6. Extend this approach to East, South and West.
+
+## 7. Limitations
+
+- Discount levels are few and tied to sub-categories, and many cells are small or empty: the analysis cannot separate the effect of the discount from the effect of the product.
+- Marginal effects average over a step-like relationship, so they should not be read as a smooth rule.
+- Pseudo R² (about 0.74) and AUC (about 0.97) are very high because profit is mechanically linked to price, cost and discount.
+- The dataset is simulated and covers Central only: results describe associations, not cause and effect.
+- Break-even discounts are rough estimates from the median order of each sub-category.
+
+## Supporting tables (not shown as tables on the slides)
+
+These tables back up statements made on the slides.
+
+**A. Sub-categories with a negative margin in Central**
+
+```{r}
+#| label: table-subcategory
+central %>%
+  group_by(sub_category) %>%
+  summarise(
+    revenue      = sum(sales),
+    avg_discount = mean(discount),
+    margin       = sum(profit) / sum(sales),
+    .groups = "drop"
+  ) %>%
+  filter(margin < 0) %>%
+  arrange(margin) %>%
+  transmute(
+    `Sub-category`  = sub_category,
+    `Revenue ($)`   = comma(revenue, accuracy = 1),
+    `Avg. discount` = percent(avg_discount, accuracy = 0.1),
+    `Profit margin` = percent(margin, accuracy = 0.1)
+  ) %>%
+  show_table()
+```
+
+**B. The same 20% discount, by sub-category**
+
+```{r}
+#| label: table5-same-discount
+table5_num <- central %>%
+  filter(discount_lvl == 20) %>%
+  group_by(category, sub_category) %>%
+  summarise(n = n(), loss = sum(is_loss), rate = loss / n, .groups = "drop") %>%
+  arrange(desc(rate))
+
+table5_num %>%
+  transmute(
+    Category        = category,
+    `Sub-category`  = sub_category,
+    `Loss-making orders / total` = sprintf("%d/%d (%.1f%%)", loss, n, 100 * rate)
+  ) %>%
+  show_table()
+```
+
+**C. Actual discount vs. estimated break-even discount (all 17 sub-categories)**
+
+Break-even = 1 − cost / list price, where list price = Sales / (1 − Discount) and cost = Sales − Profit. This is a rough estimate based on the median order; it varies by product within a sub-category. The range in brackets covers the middle 50% of orders.
+
+```{r}
+#| label: table7-breakeven
+central <- central %>%
+  mutate(
+    list_price = sales / (1 - discount),
+    cost       = sales - profit,
+    breakeven  = 1 - cost / list_price
+  )
+
+table7_num <- central %>%
+  group_by(category, sub_category) %>%
+  summarise(
+    levels    = paste(sort(unique(discount_lvl)), collapse = ", "),
+    orders    = n(),
+    losses    = sum(is_loss),
+    be_median = median(breakeven),
+    be_q1     = quantile(breakeven, 0.25),
+    be_q3     = quantile(breakeven, 0.75),
+    .groups = "drop"
+  )
+
+table7_num %>%
+  transmute(
+    Category                  = category,
+    `Sub-category`            = sub_category,
+    `Discount levels used (%)` = levels,
+    `Orders (loss-making)`    = sprintf("%d (%d)", orders, losses),
+    `Break-even, median (middle 50% of orders)` =
+      sprintf("~%.1f%% (%.0f–%.0f%%)", be_median * 100, be_q1 * 100, be_q3 * 100)
+  ) %>%
+  show_table()
+```
+
+## Reconciliation with the slides
+
+Each row compares a number reproduced by this file with the value on the slides. `OK` means the difference is within rounding. If a row shows `CHECK`, the data file or the code differs from the version used for the slides.
+
+```{r}
+#| label: reconciliation
+rg   <- function(col, r) table1b_num[[col]][table1b_num$region == r] * 100
+t2   <- function(cat, col) table2_num[[col]][table2_num$category == cat] * 100
+cell <- function(lvl, cat, col) tab_threshold_num[[col]][tab_threshold_num$discount_lvl == lvl & tab_threshold_num$category == cat]
+ame  <- function(obj, term) obj$mfxest[term, 1] * 100
+be   <- function(sub) table7_num$be_median[table7_num$sub_category == sub] * 100
+rt   <- function(sub) table5_num$rate[table5_num$sub_category == sub] * 100
+
+checks <- tribble(
+  ~Item,                                             ~Reproduced,                         ~Page,    ~Tol,
+  # Key figures
+  "Profit on profitable orders ($)",                 profit_pos,                          449336,   1,
+  "Total losses ($)",                                loss_total,                          157039,   1,
+  "Net profit ($)",                                  net_profit,                          292297,   1,
+  "Losses as % of profit on profitable orders",      loss_share * 100,                    34.95,    0.01,
+  # Table 1 and 2
+  "Central total loss ($)",                          table1_num$Total[table1_num$region == "Central"], 56371, 1,
+  "Central: orders that lose money (%)",             rg("share_orders_lose", "Central"),  32.0,     0.05,
+  "East: orders that lose money (%)",                rg("share_orders_lose", "East"),     19.2,     0.05,
+  "South: orders that lose money (%)",               rg("share_orders_lose", "South"),    16.0,     0.05,
+  "West: orders that lose money (%)",                rg("share_orders_lose", "West"),     9.9,      0.05,
+  "Central: loss as % of profit",                    rg("loss_pct_of_profit", "Central"), 58.6,     0.05,
+  "East: loss as % of profit",                       rg("loss_pct_of_profit", "East"),    34.6,     0.05,
+  "South: loss as % of profit",                      rg("loss_pct_of_profit", "South"),   37.0,     0.05,
+  "West: loss as % of profit",                       rg("loss_pct_of_profit", "West"),    17.2,     0.05,
+  # Table 3
+  "Furniture: profit margin (%)",                    t2("Furniture", "margin"),           -1.7,     0.05,
+  "Furniture: orders that lose money (%)",           t2("Furniture", "share_loss"),       65.8,     0.05,
+  "Furniture: orders discounted 30%+ (%)",           t2("Furniture", "share_30plus"),     67.2,     0.05,
+  "Office Supplies: orders that lose money (%)",     t2("Office Supplies", "share_loss"), 26.5,     0.05,
+  "Office Supplies: orders discounted 30%+ (%)",     t2("Office Supplies", "share_30plus"), 21.2,   0.05,
+  "Technology: orders that lose money (%)",          t2("Technology", "share_loss"),      11.7,     0.05,
+  "Technology: orders discounted 30%+ (%)",          t2("Technology", "share_30plus"),    4.3,      0.05,
+  # Concentration of losses
+  "Orders discounted 30%+ (% of Central orders)",    share_orders_30 * 100,               27.7,     0.05,
+  "Loss share from orders discounted 30%+ (%)",      share_loss_30 * 100,                 94.1,     0.05,
+  "Loss share from 80% discounts (%)",               share_loss_80 * 100,                 54.2,     0.05,
+  "Orders at 0-10% discount",                        n_0_10,                              846,      0,
+  "Orders at 0% discount",                           n_0pct,                              828,      0,
+  "Orders at 10% discount",                          n_10pct,                             18,       0,
+  "Loss-making orders at 0-10% discount",            loss_0_10,                           0,        0,
+  # Table 5 cells (loss / total)
+  "Furniture 30%: loss-making orders",               cell(30, "Furniture", "loss"),       134,      0,
+  "Furniture 30%: total orders",                     cell(30, "Furniture", "n"),          142,      0,
+  "Office Supplies 20%: loss-making orders",         cell(20, "Office Supplies", "loss"), 76,       0,
+  "Office Supplies 20%: total orders",               cell(20, "Office Supplies", "n"),    594,      0,
+  "Office Supplies 80%: loss-making orders",         cell(80, "Office Supplies", "loss"), 301,      0,
+  "Technology 20%: loss-making orders",              cell(20, "Technology", "loss"),      40,       0,
+  "Technology 40%: loss-making orders",              cell(40, "Technology", "loss"),      8,        0,
+  # Supporting tables B and C
+  "Storage at 20%: loss rate (%)",                   rt("Storage"),                       47.0,     0.05,
+  "Supplies at 20%: loss rate (%)",                  rt("Supplies"),                      42.3,     0.05,
+  "Accessories at 20%: loss rate (%)",               rt("Accessories"),                   29.8,     0.05,
+  "Bookcases: break-even, median (%)",               be("Bookcases"),                     19.5,     0.6,
+  "Tables: break-even, median (%)",                  be("Tables"),                        19,       0.6,
+  "Binders: break-even, median (%)",                 be("Binders"),                       48,       0.6,
+  # Table 4 (AME, percentage points)
+  "AME Model 1: Discount",                           ame(ame1, "discount_pct"),           1.08,     0.006,
+  "AME Model 1: Log Sales",                          ame(ame1, "log_sales"),              0.99,     0.006,
+  "AME Model 1: Office Supplies",                    ame(ame1, "category_factorOffice Supplies"), -13.70, 0.006,
+  "AME Model 1: Technology",                         ame(ame1, "category_factorTechnology"),      -10.17, 0.006,
+  "AME Model 2: Discount",                           ame(ame2, "discount_pct"),           1.40,     0.006,
+  "AME Model 2: Log Sales",                          ame(ame2, "log_sales"),              2.06,     0.006,
+  "AME Model 2: Office Supplies",                    ame(ame2, "category_factorOffice Supplies"), -13.55, 0.006,
+  "AME Model 2: Technology",                         ame(ame2, "category_factorTechnology"),      -10.10, 0.006,
+  "AME Model 2: Discount × Log Sales",               ame(ame2, "discount_pct:log_sales"), -0.05,    0.006,
+  "AME Model 3: Discount",                           ame(ame3, "discount_pct"),           1.78,     0.006,
+  "AME Model 3: Log Sales",                          ame(ame3, "log_sales"),              1.09,     0.006,
+  "AME Model 3: Discount × Office Supplies",         ame(ame3, "discount_pct:category_factorOffice Supplies"), 2.08, 0.006,
+  "AME Model 3: Discount × Technology",              ame(ame3, "discount_pct:category_factorTechnology"),      -1.15, 0.006,
+  # Model validation
+  "Pseudo R² Model 1",                               vals[[1]][["pseudo_r2"]],            0.7361,   0.0003,
+  "Pseudo R² Model 2",                               vals[[2]][["pseudo_r2"]],            0.7363,   0.0003,
+  "Pseudo R² Model 3",                               vals[[3]][["pseudo_r2"]],            0.7426,   0.0003,
+  "Max VIF Model 1",                                 vals[[1]][["max_vif"]],              1.20,     0.006,
+  "Max VIF Model 2",                                 vals[[2]][["max_vif"]],              2.12,     0.006,
+  "Max VIF Model 3",                                 vals[[3]][["max_vif"]],              2.52,     0.006,
+  "AUC Model 1",                                     vals[[1]][["auc"]],                  0.9696,   0.0002,
+  "AUC Model 2",                                     vals[[2]][["auc"]],                  0.9697,   0.0002,
+  "AUC Model 3",                                     vals[[3]][["auc"]],                  0.9702,   0.0002,
+  "Hosmer-Lemeshow p Model 1",                       vals[[1]][["hl_p"]],                 0.6039,   0.0003,
+  "Hosmer-Lemeshow p Model 2",                       vals[[2]][["hl_p"]],                 0.6593,   0.0003,
+  "Hosmer-Lemeshow p Model 3",                       vals[[3]][["hl_p"]],                 0.7003,   0.0003
+) %>%
+  mutate(
+    Reproduced = round(unname(Reproduced), 4),
+    Status     = if_else(abs(Reproduced - Page) <= Tol, "OK", "CHECK")
+  )
+
+checks %>% dplyr::select(Item, Reproduced, Page, Status) %>% show_table()
+```
+
+```{r}
+#| label: reconciliation-summary
+#| results: asis
+cat("**", sum(checks$Status == "OK"), " of ", nrow(checks), " numbers match the slides.**\n", sep = "")
+```
+
+## Appendix (optional, not on the slides)
+
+Discounts in this dataset are applied by state. This chunk shows where Central's losses come from at state level. It is not evaluated by default; set `eval: true` to run it.
+
+```{r}
+#| label: appendix-state
+#| eval: false
+central %>%
+  group_by(state_province) %>%
+  summarise(
+    orders       = n(),
+    avg_discount = mean(discount),
+    loss_rate    = mean(is_loss),
+    profit       = sum(profit),
+    .groups = "drop"
+  ) %>%
+  arrange(profit) %>%
+  mutate(avg_discount = percent(avg_discount, accuracy = 0.1),
+         loss_rate    = percent(loss_rate, accuracy = 0.1),
+         profit       = dollar(profit, accuracy = 1)) %>%
+  show_table()
+```
