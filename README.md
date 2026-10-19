@@ -28,5 +28,7 @@ Loss-making orders wipe out the equivalent of **34.95%** of the profit earned on
    quarto render Retail_Sales_Analysis_Central_Discount.qmd
    ```
 The last section of the output, **Reconciliation with the slides**, compares every reproduced number with the value on the slides (`OK` / `CHECK`).
+## Read the full project walkthrough on Notion: 
+https://large-gauge-ed0.notion.site/Retail-Sales-Analysis-Discount-Strategy-Loss-Risk-in-the-Central-Region-3f770e6c6a9680b8838cd54556d2e2fc 
 ## Limitations
 The dataset is simulated and covers Central only, discount levels are few and tied to sub-categories, so results describe associations, not cause and effect. Pseudo R² (about 0.74) and AUC (about 0.97) are very high because profit is mechanically linked to price, cost and discount.
